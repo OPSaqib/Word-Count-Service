@@ -11,7 +11,8 @@ services:
   server:
     build: .
     container_name: wordcount-server
-    command: ["python", "server.py"] # When the server starts run server.py
+    #command: ["python", "server.py"] # When the server starts run server.py
+    command: ["python", "-u", "server.py"] # When the server starts run server.py
     depends_on: # Wait for Redis to be ready before starting the server
       - redis
     ports:
