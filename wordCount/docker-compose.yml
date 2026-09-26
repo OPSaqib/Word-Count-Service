@@ -4,15 +4,15 @@ services:
   redis:
     image: redis:7-alpine
     container_name: wordcount-redis
-    volumes:
+    volumes: # Store Redis data in a persistent Docker volume
       - redis-data:/data
 
 # Word Count Server service
   server:
     build: .
     container_name: wordcount-server
-    command: ["python", "server.py"]
-    depends_on:
+    command: ["python", "server.py"] # When the server starts run server.py
+    depends_on: # Wait for Redis to be ready before starting the server
       - redis
     ports:
       - "18861:18861"
@@ -21,12 +21,12 @@ services:
   client:
     build: .
     container_name: wordcount-client
-    command: ["sh", "-c", "tail -f /dev/null"]
-    depends_on:
+    command: ["sh", "-c", "tail -f /dev/null"] # Keep the client container running
+    depends_on: # Wait for the server to be ready before starting the client
       - server
-    volumes:
+    volumes: # Mount the results directory from the host to the container
       - ./results:/app/results
 
-# ??
+# Docker volumes
 volumes:
   redis-data:
