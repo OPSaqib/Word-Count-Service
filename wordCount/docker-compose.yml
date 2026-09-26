@@ -1,0 +1,32 @@
+services:
+
+# Redis service 
+  redis:
+    image: redis:7-alpine
+    container_name: wordcount-redis
+    volumes:
+      - redis-data:/data
+
+# Word Count Server service
+  server:
+    build: .
+    container_name: wordcount-server
+    command: ["python", "server.py"]
+    depends_on:
+      - redis
+    ports:
+      - "18861:18861"
+
+# Word Count Client service
+  client:
+    build: .
+    container_name: wordcount-client
+    command: ["sh", "-c", "tail -f /dev/null"]
+    depends_on:
+      - server
+    volumes:
+      - ./results:/app/results
+
+# ??
+volumes:
+  redis-data:
