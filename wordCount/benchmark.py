@@ -1,227 +1,254 @@
 import csv
 import math
 import os
+import random
+import re
 import statistics
 import threading
 import time
 
-# Multiple requests concurrently with threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import redis
 import rpyc
 
-# Constants for server connection
 SERVER_HOST = "server"
 SERVER_PORT = 18861
 
 TEXT_REFERENCE = "sample2.txt"
 
+# Optional local copy of the text (inside the client container) used to draw
+# real words as keywords. If it does not exist, synthetic keywords are used.
+LOCAL_TEXT_PATH = "texts/sample2.txt"
+
 # Request rates (requests per second)
+REQUEST_RATES = [500, 600, 700, 800, 900, 1000]
 
-REQUEST_RATES = [1000, 1020, 1040, 1060, 1080, 1100]
-
-#REQUEST_RATES = [50, 60, 70, 80, 90, 100]
-
-# Run each workload for 10 seconds
 DURATION_SECONDS = 10
 
-# Maximum number of concurrent threads to use for sending requests
-MAX_WORKERS = 100
+# Every rate sends at least this many requests, so the p99 is meaningful
+MIN_REQUESTS = 1000
 
-# Keywords to check
-KEYWORDS = [
-    "the",
-    "and",
-    "time",
-    "it",
-    "world",
-    "pleasure"
-]
+# Number of client connections (simulated clients). Requests are spread over them
+# round-robin. Sending never waits for a connection to be free: each request is
+# written to its socket immediately and the reply is handled whenever it arrives.
+NUM_CONNECTIONS = 100
 
-# Thread local storage for RPyC connections
-thread_local = threading.local()
+# Give up waiting for outstanding replies after this long once sending is finished
+RESPONSE_TIMEOUT_SECONDS = 60
 
-# Create a connection for the current thread
-def get_connection():
+# "cold": every request uses a different keyword -> every request is a cache miss
+# "warm": cache is pre-filled, only a few keywords -> every request is a cache hit
+CACHE_MODE = "cold"
 
-    # If current thread does not have connection, create a new connection
-    if not hasattr(thread_local, "connection"):
+WARM_KEYWORDS = ["the", "and", "time", "it", "world", "pleasure"]
 
-        thread_local.connection = rpyc.connect(SERVER_HOST, SERVER_PORT)
 
-    return thread_local.connection # Return the connection for the current thread
-
-# Send one request to the server and return the latency and count
-def send_one_request(keyword):
-
-    # Get the connection for the current thread
-    connection = get_connection()
-
-    # Measure the time taken to get the count from the server
-    start = time.perf_counter()
-
-    # Call exposed method on server count_word(keyword, text_reference)
-    count = connection.root.count_word(keyword, TEXT_REFERENCE)
-
-    # Measure the time taken to get the count from the server
-    end = time.perf_counter()
-
-    # Calculate latency in milliseconds
-    latency_ms = (end - start) * 1000
-
-    # Return the latency and count
-    return latency_ms, count
-
-# Calculate the 99th percentile of a list of values
 def percentile_99(values):
-
-    # Sort the values
     sorted_values = sorted(values)
-
-    # Calculate the index of the 99th percentile
     index = math.ceil(0.99 * len(sorted_values)) - 1
-
-    # Return the value at the 99th percentile index
     return sorted_values[index]
 
-# Clear the word count cache in Redis (for each experiment)
-def clear_word_count_cache():
 
-    # Create a Redis client to connect to the Redis server
+def clear_cache():
     client = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-    # Get all keys that match the pattern "wc:*" (word count cache keys)
     keys = list(client.scan_iter("wc:*"))
-
-    # If there are any keys, delete them from the Redis cache
     if keys:
         client.delete(*keys)
+    client.delete("hot_keywords")
 
-# Run an experiment with a given request rate (requests per second)
-def run_experiment(rate):
 
+def load_word_pool():
+    if not os.path.isfile(LOCAL_TEXT_PATH):
+        return []
+    with open(LOCAL_TEXT_PATH, "r", encoding="utf-8", errors="ignore") as file:
+        text = file.read().lower()
+    words = sorted(set(re.findall(r"[a-z]+", text)))
+    random.Random(42).shuffle(words)
+    return words
+
+
+WORD_POOL = load_word_pool()
+
+
+def make_keywords(n):
+    if CACHE_MODE == "warm":
+        return [WARM_KEYWORDS[i % len(WARM_KEYWORDS)] for i in range(n)]
+
+    # cold: n unique keywords. Real words first, synthetic ones if the pool runs out.
+    # A synthetic keyword costs the same as a real one (the whole file is still scanned).
+    keywords = WORD_POOL[:n]
+    keywords += [f"nokeyword{i}" for i in range(len(keywords), n)]
+    return keywords
+
+
+def prewarm_cache():
+    # Fill the cache with a plain synchronous connection (untimed)
+    connection = rpyc.connect(SERVER_HOST, SERVER_PORT)
+    for keyword in WARM_KEYWORDS:
+        connection.root.count_word(keyword, TEXT_REFERENCE)
+    connection.close()
+
+
+def open_connections(n):
+    connections = []
+    async_calls = []
+
+    for _ in range(n):
+        connection = rpyc.connect(SERVER_HOST, SERVER_PORT)
+
+        # Untimed first-touch work: handshake and fetching the remote method proxy
+        connection.ping()
+        async_call = rpyc.async_(connection.root.count_word)
+
+        # This thread only receives replies for this connection and fires callbacks.
+        # It does not limit sending in any way.
+        threading.Thread(target=connection.serve_all, daemon=True).start()
+
+        connections.append(connection)
+        async_calls.append(async_call)
+
+    return connections, async_calls
+
+
+def run_experiment(rate, async_calls):
     print()
     print("=" * 60)
-    print(f"Starting experiment: " f"{rate} requests/second")
+    print(f"Starting experiment: {rate} requests/second ({CACHE_MODE} cache)")
     print("=" * 60)
 
-    # Clear the word count cache in Redis before starting the experiment
-    clear_word_count_cache()
+    clear_cache()
 
-    # Calculate the total number of requests to send during the experiment
-    number_of_requests = (rate * DURATION_SECONDS)
+    if CACHE_MODE == "warm":
+        prewarm_cache()
 
+    number_of_requests = max(rate * DURATION_SECONDS, MIN_REQUESTS)
+    keywords = make_keywords(number_of_requests)
+
+    lock = threading.Lock()
+    all_done = threading.Event()
     latencies = []
-    errors = 0
+    error_messages = []
+    completed = 0
 
-    futures = [] # Unfinished request to keep track of completion of requests
+    def make_callback(sent_time):
+        # Called when the reply for one request arrives
+        def on_response(result):
+            nonlocal completed
+            received_time = time.perf_counter()
 
-    # To help calculate when requests should be send to achieve desired rate of requests per second
+            with lock:
+                try:
+                    _ = result.value  # raises if the server returned an error
+                    latencies.append((received_time - sent_time) * 1000)
+                except Exception as error:
+                    error_messages.append(str(error))
+
+                completed += 1
+                if completed == number_of_requests:
+                    all_done.set()
+
+        return on_response
+
+    max_lag_ms = 0.0
     start_time = time.perf_counter()
 
-    # Use a thread pool executor to send requests concurrently
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    for request_number in range(number_of_requests):
+        target_time = start_time + request_number / rate
+        sleep_time = target_time - time.perf_counter()
 
-        # Schedule requests to be sent at the specified rate
-        for request_number in range(number_of_requests):
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+            # The generator is behind schedule: the client itself is a bottleneck
+            max_lag_ms = max(max_lag_ms, -sleep_time * 1000)
 
-            # Desired send time for this request
-            target_time = (start_time + request_number / rate)
+        async_call = async_calls[request_number % len(async_calls)]
 
-            # Calculate how long to sleep until the target time for this request
-            sleep_time = (target_time - time.perf_counter())
+        # SENT: the timestamp is taken immediately before the request is written out
+        sent_time = time.perf_counter()
+        result = async_call(keywords[request_number], TEXT_REFERENCE)
+        result.add_callback(make_callback(sent_time))
 
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+    send_elapsed = time.perf_counter() - start_time
 
-            # Select a keyword to send with this request from the list
-            keyword = KEYWORDS[request_number % len(KEYWORDS)]
+    # Wait for outstanding replies (nothing is sent anymore, this only collects)
+    finished = all_done.wait(timeout=RESPONSE_TIMEOUT_SECONDS)
 
-            # Give one worker the job of running send_one_request(keyword)
-            future = executor.submit(send_one_request, keyword)
+    with lock:
+        successful = len(latencies)
+        errors = len(error_messages)
+        lost = number_of_requests - completed
+        latencies_snapshot = list(latencies)
 
-            futures.append(future)
+    if not finished:
+        print(f"WARNING: {lost} replies did not arrive within "
+              f"{RESPONSE_TIMEOUT_SECONDS} s and are not in the statistics.")
 
-        # Wait for all requests to complete and collect the results
-        for future in as_completed(futures):
-
-            # Get result of request if no error, otherwise count the error and print it
-            try:
-
-                # Get the latency and save it to the list of latencies 
-                latency_ms, _ = future.result()
-
-                latencies.append(latency_ms)
-
-            except Exception as error:
-
-                errors += 1
-
-                print("Request failed:", error)
-
-    if not latencies:
+    if not latencies_snapshot:
         raise RuntimeError("No successful requests")
 
-    # Calculate average latency and 99th percentile latency
-    average_latency = statistics.mean(latencies)
+    achieved_rate = number_of_requests / send_elapsed
+    average_latency = statistics.mean(latencies_snapshot)
+    p99_latency = percentile_99(latencies_snapshot)
 
-    p99_latency = percentile_99(latencies)
+    print(f"Requests: {number_of_requests}")
+    print(f"Successful: {successful}")
+    print(f"Errors: {errors}   No reply: {lost}")
+    if error_messages:
+        print("First error:", error_messages[0])
+    print(f"Achieved send rate: {achieved_rate:.1f} req/s (target {rate})")
+    print(f"Max send lag: {max_lag_ms:.1f} ms")
+    print(f"Average latency: {average_latency:.3f} ms")
+    print(f"P99 latency: {p99_latency:.3f} ms")
 
-    # Print the results of the experiment
-    print(f"Requests: " f"{number_of_requests}")
-
-    print(f"Successful: " f"{len(latencies)}")
-
-    print(f"Errors: " f"{errors}")
-
-    print(f"Average latency: " f"{average_latency:.3f} ms")
-
-    print(f"P99 latency: " f"{p99_latency:.3f} ms")
+    if achieved_rate < 0.95 * rate:
+        print("WARNING: client could not sustain the target rate; "
+              "this point is limited by the load generator, not the server.")
 
     return {
         "rate": rate,
         "requests": number_of_requests,
-        "successful": len(latencies),
-        "errors": errors,
+        "successful": successful,
+        "errors": errors + lost,
         "average_ms": average_latency,
-        "p99_ms": p99_latency
+        "p99_ms": p99_latency,
+        "achieved_rate": achieved_rate,
+        "max_send_lag_ms": max_lag_ms,
+        "cache_mode": CACHE_MODE,
     }
 
 
 def main():
-
-    # Create a directory to store the results if it doesn't exist
     os.makedirs("results", exist_ok=True)
+
+    connections, async_calls = open_connections(NUM_CONNECTIONS)
 
     results = []
 
-    # Run experiments for each request rate and collect the results
-    for rate in REQUEST_RATES:
+    try:
+        for rate in REQUEST_RATES:
+            results.append(run_experiment(rate, async_calls))
+            time.sleep(3)
+    finally:
+        for connection in connections:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
-        result = run_experiment(rate)
-
-        results.append(result)
-
-        # Short rest before next workload
-        time.sleep(3)
-
-    # Save the results to a CSV file
-    output_file = ("results/phase2_results.csv")
+    output_file = "results/phase2_results.csv"
 
     with open(output_file, "w", newline="", encoding="utf-8") as file:
-
         writer = csv.DictWriter(
             file,
-            fieldnames=["rate", "requests", "successful", "errors", "average_ms", "p99_ms"]
+            fieldnames=["rate", "requests", "successful", "errors",
+                        "average_ms", "p99_ms", "achieved_rate",
+                        "max_send_lag_ms", "cache_mode"],
         )
-
         writer.writeheader()
-
         writer.writerows(results)
 
     print()
-    print(f"Results saved to " f"{output_file}")
+    print(f"Results saved to {output_file}")
 
 
 if __name__ == "__main__":
