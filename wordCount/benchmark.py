@@ -18,7 +18,10 @@ SERVER_PORT = 18861
 TEXT_REFERENCE = "sample2.txt"
 
 # Request rates (requests per second)
-REQUEST_RATES = [20, 40, 60, 80, 100]
+
+REQUEST_RATES = [880, 890, 900, 910, 920]
+
+#REQUEST_RATES = [50, 60, 70, 80, 90, 100]
 
 # Run each workload for 10 seconds
 DURATION_SECONDS = 10
