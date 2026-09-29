@@ -19,7 +19,7 @@ TEXT_REFERENCE = "sample2.txt"
 
 # Request rates (requests per second)
 
-REQUEST_RATES = [880, 890, 900, 910, 920]
+REQUEST_RATES = [1000, 1020, 1040, 1060, 1080, 1100]
 
 #REQUEST_RATES = [50, 60, 70, 80, 90, 100]
 
@@ -28,7 +28,6 @@ DURATION_SECONDS = 10
 
 # Maximum number of concurrent threads to use for sending requests
 MAX_WORKERS = 100
-
 
 # Keywords to check
 KEYWORDS = [
