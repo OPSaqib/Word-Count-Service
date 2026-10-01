@@ -1,11 +1,11 @@
 import sys
 import time
+from benchmark import clear_cache
 import rpyc
 
 # Constants for server connection
 SERVER_HOST = "server"
 SERVER_PORT = 18861
-
 
 def main():
 
@@ -39,7 +39,7 @@ def main():
     # Calculate latency in milliseconds
     latency_ms = (end - start) * 1000
 
-    print()
+    #print()
     print(f"Keyword: {keyword}")
     print(f"Text: {text_reference}")
     print(f"Occurrences: {count}")
