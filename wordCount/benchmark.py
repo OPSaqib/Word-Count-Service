@@ -20,7 +20,7 @@ TEXT_REFERENCE = "sample2.txt"
 LOCAL_TEXT_PATH = "texts/sample2.txt"
 
 # Request rates (requests per second)
-REQUEST_RATES = [500, 600, 700, 800, 900, 1000]
+REQUEST_RATES = [800, 900, 1000, 1100, 1200]
 
 DURATION_SECONDS = 10
 
