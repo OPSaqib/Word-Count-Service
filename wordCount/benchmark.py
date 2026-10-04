@@ -10,9 +10,12 @@ import time
 import redis
 import rpyc
 
-# Constants for server connection
-SERVER_HOST = "server"
+# Connect to the load balancer by default, but allow override via environment variable
+SERVER_HOST = os.getenv("SERVER_HOST", "load-balancer")
 SERVER_PORT = 18861
+
+# Load balancing algorithm to use (least_connections or least_response_time)
+LB_ALGORITHM = os.getenv("LB_ALGORITHM", "least_connections").strip().lower()
 
 TEXT_REFERENCE = "sample2.txt"
 
@@ -53,7 +56,7 @@ def clear_cache():
         client.delete(*keys)
     client.delete("hot_keywords")
 
-
+# Load all words from the text file into a list, shuffle them, and return the list
 def load_word_pool():
     if not os.path.isfile(LOCAL_TEXT_PATH): # No text file found, return empty list
         return []
@@ -110,12 +113,22 @@ def open_connections(n):
 
     return connections, async_calls
 
+# Close all RPyC connections
+def close_connections(connections):
+    for connection in connections:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
 # Run a single experiment with the request rate and async calls
-def run_experiment(rate, async_calls):
+def run_experiment(rate):
     print()
-    print("=" * 60)
-    print(f"Starting experiment: {rate} requests/second ({CACHE_MODE} cache)")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"Starting Phase III experiment: " f"{rate} requests/second")
+    print(f"Load-balancing algorithm: " f"{LB_ALGORITHM}")
+    print(f"Cache mode: " f"{CACHE_MODE}")
+    print("=" * 70)
 
     clear_cache() # Clear Redis cache before each experiment
 
@@ -126,6 +139,9 @@ def run_experiment(rate, async_calls):
     # Make keywords for number of requests calculated
     number_of_requests = max(rate * DURATION_SECONDS, MIN_REQUESTS)
     keywords = make_keywords(number_of_requests)
+
+    # Open fresh connections to server for this experiment
+    connections, async_calls = (open_connections(NUM_CONNECTIONS))
 
     # Threads to handle replies that finish at the same time to prevent modifying writing to arrays simultaneously
     lock = threading.Lock()
@@ -222,7 +238,8 @@ def run_experiment(rate, async_calls):
         print("WARNING: client could not sustain the target rate; "
               "this point is limited by the load generator, not the server.")
 
-    return {
+    result_row = {
+        "algorithm": LB_ALGORITHM,
         "rate": rate,
         "requests": number_of_requests,
         "successful": successful,
@@ -234,42 +251,53 @@ def run_experiment(rate, async_calls):
         "cache_mode": CACHE_MODE,
     }
 
+    close_connections(connections)
+
+    return result_row
+
 
 def main():
-    os.makedirs("results", exist_ok=True)
 
-    # Open multiple connections to the server and get async calls for count_word method
-    connections, async_calls = open_connections(NUM_CONNECTIONS)
+    if LB_ALGORITHM not in {"least_connections", "least_response_time"}:
+
+        raise ValueError("LB_ALGORITHM must be " "'least_connections' or ""'least_response_time'")
+    
+    os.makedirs("results", exist_ok=True)
 
     results = []
 
     # Run experiments for each request rate and collect results then close connections
-    try:
-        for rate in REQUEST_RATES:
-            results.append(run_experiment(rate, async_calls))
-            time.sleep(3)
-    finally:
-        for connection in connections:
-            try:
-                connection.close()
-            except Exception:
-                pass
+    for rate in REQUEST_RATES:
 
-    # Write to csv and save results
-    output_file = "results/phase2_results.csv"
+        results.append(run_experiment(rate))
+        time.sleep(3)
+
+    # Write to CSV and save results 
+    output_file = (f"results/" f"phase3_" f"{LB_ALGORITHM}.csv")
 
     with open(output_file, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["rate", "requests", "successful", "errors",
-                        "average_ms", "p99_ms", "achieved_rate",
-                        "max_send_lag_ms", "cache_mode"],
+
+        writer = csv.DictWriter(file, fieldnames=[
+                "algorithm",
+                "rate",
+                "requests",
+                "successful",
+                "errors",
+                "average_ms",
+                "p99_ms",
+                "achieved_rate",
+                "max_send_lag_ms",
+                "cache_mode"
+            ]
         )
+
         writer.writeheader()
+
         writer.writerows(results)
 
     print()
-    print(f"Results saved to {output_file}")
+
+    print(f"Results saved to " f"{output_file}")
 
 
 if __name__ == "__main__":

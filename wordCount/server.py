@@ -6,36 +6,45 @@ import redis
 import rpyc
 from rpyc.utils.server import ThreadedServer
 
+
 # Directory where text files are stored in the container
 TEXT_DIRECTORY = "/app/texts"
+
+# Get server1, server2 or server3 from environment variable, default to "server"
+SERVER_NAME = os.getenv("SERVER_NAME", "server")
+
+# Log requests if LOG_REQUESTS environment variable is set to "true"
+LOG_REQUESTS = (os.getenv("LOG_REQUESTS", "false").lower() == "true")
 
 # Connect to Redis and retry until successful
 def connect_to_redis():
     while True:
-        try: 
+        try:
             # Connect to Redis server
             client = redis.Redis(host="redis", port=6379, decode_responses=True)
 
             # Test connection
             client.ping()
 
-            print("Connected to Redis")
+            print(f"{SERVER_NAME}: " f"Connected to Redis")
+
             return client
 
         # If error occurs, try again
-        except redis.exceptions.ConnectionError: 
-            print("Redis not ready, retrying")
+        except redis.exceptions.ConnectionError:
+
+            print(f"{SERVER_NAME}: " f"Redis not ready, retrying")
+
             time.sleep(1)
 
 # Save the Redis client
 redis_client = connect_to_redis()
 
-
 # Count whole-word occurrences in text
 def count_word_in_text(keyword, text):
 
     # Regex pattern to match whole words, pattern is \bkeyword\b
-    pattern = r"\b" + re.escape(keyword) + r"\b"
+    pattern = (r"\b" + re.escape(keyword) + r"\b")
 
     # Find every matching occurance of "pattern" in text ignoring case
     matches = re.findall(pattern, text, flags=re.IGNORECASE)
@@ -51,13 +60,14 @@ class WordCountService(rpyc.Service):
         # Get filepath to be read from texts directory
         filename = os.path.basename(text_reference)
 
-        filepath = os.path.join(TEXT_DIRECTORY,filename)
+        filepath = os.path.join(TEXT_DIRECTORY, filename)
 
         if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Text file '{filename}' does not exist.")
+
+            raise FileNotFoundError(f"Text file " f"'{filename}' does not exist.")
 
         # Key,value pair for REDIS cache, format: wc:<filename>:<keyword> : VAL
-        cache_key = f"wc:{filename}:{keyword.casefold()}"
+        cache_key = (f"wc:" f"{filename}:" f"{keyword.casefold()}")
 
         # Increase the count of the keyword in the sorted set "hot_keywords" in Redis
         redis_client.zincrby("hot_keywords", 1, keyword.casefold())
@@ -69,13 +79,13 @@ class WordCountService(rpyc.Service):
 
         if cached_result is not None:
 
-            print(f"CACHE HIT | " f"keyword={keyword} | " f"file={filename} | " f"count={cached_result}")
+            if LOG_REQUESTS:
+
+                print(f"HANDLED | " f"server={SERVER_NAME} | " f"keyword={keyword} | " f"cache=HIT | " f"count={cached_result}")
 
             return int(cached_result)
 
         ####If not in cache, read file and count occurrences####
-
-        print(f"CACHE MISS | " f"keyword={keyword} | " f"file={filename}")
 
         # Open text file and get it ready to read, ignore encoding errors
         with open(filepath, "r", encoding="utf-8", errors="ignore") as file:
@@ -88,18 +98,19 @@ class WordCountService(rpyc.Service):
 
         redis_client.set(cache_key, count)
 
-        print(f"CALCULATED | " f"keyword={keyword} | " f"file={filename} | " f"count={count}")
+        if LOG_REQUESTS:
+            print(f"HANDLED | " f"server={SERVER_NAME} | " f"keyword={keyword} | " f"cache=MISS | " f"count={count}")
 
         return count
 
-
+# Start the RPC server
 if __name__ == "__main__":
 
-    print("Starting Word Count Server")
+    print(f"Starting Word Count Server: " f"{SERVER_NAME}")
+
     print("Listening on port 18861")
 
-    # Create threader RPC server, 
-    # listen for connections on all network interfaces inside this container on port 18861
+    # Create a RPyC network on WordCountService
     server = ThreadedServer(WordCountService, hostname="0.0.0.0", port=18861)
 
     server.start()

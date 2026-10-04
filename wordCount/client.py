@@ -2,9 +2,10 @@ import sys
 import time
 from benchmark import clear_cache
 import rpyc
+import os
 
-# Constants for server connection
-SERVER_HOST = "server"
+# Connect to the load balancer by default, but allow override via environment variable
+SERVER_HOST = os.getenv("SERVER_HOST", "load-balancer")
 SERVER_PORT = 18861
 
 def main():
@@ -20,7 +21,7 @@ def main():
     keyword = sys.argv[1]
     text_reference = sys.argv[2]
 
-    print("Connecting to server")
+    print(f"Connecting to " f"{SERVER_HOST}:{SERVER_PORT}")
 
     # Create a connection to the server using RPyC
     connection = rpyc.connect(SERVER_HOST, SERVER_PORT)

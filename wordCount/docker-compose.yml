@@ -7,24 +7,67 @@ services:
     volumes: # Store Redis data in a persistent Docker volume
       - redis-data:/data
 
-# Word Count Server service
-  server:
+
+# Word Count Server 1 service
+  server1:
     build: .
-    container_name: wordcount-server
-    #command: ["python", "server.py"] # When the server starts run server.py
+    container_name: wordcount-server1
     command: ["python", "-u", "server.py"] # When the server starts run server.py
     depends_on: # Wait for Redis to be ready before starting the server
       - redis
+    environment:
+      SERVER_NAME: server1
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+
+
+# Word Count Server 2 service
+  server2:
+    build: .
+    container_name: wordcount-server2
+    command: ["python", "-u", "server.py"] # When the server starts run server.py
+    depends_on: # Wait for Redis to be ready before starting the server
+      - redis
+    environment:
+      SERVER_NAME: server2
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+
+
+  # Word Count Server 3 service
+  server3:
+    build: .
+    container_name: wordcount-server3
+    command: ["python", "-u", "server.py"] # When the server starts run server.py
+    depends_on: # Wait for Redis to be ready before starting the server
+      - redis
+    environment:
+      SERVER_NAME: server3
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+
+  # Word Count Load Balancer service
+  load-balancer:
+    build: .
+    container_name: wordcount-load-balancer
+    command: ["python", "-u", "load_balancer.py"]
+    depends_on:
+      - server1
+      - server2
+      - server3
+    environment:
+      LB_ALGORITHM: ${LB_ALGORITHM:-least_connections}
     ports:
       - "18861:18861"
 
-# Word Count Client service
+  # Word Count Client service
   client:
     build: .
     container_name: wordcount-client
-    command: ["sh", "-c", "tail -f /dev/null"] # Keep the client container running
+    command:
+      ["sh", "-c", "tail -f /dev/null"] # Keep the client container running
     depends_on: # Wait for the server to be ready before starting the client
-      - server
+      - load-balancer
+    environment:
+      SERVER_HOST: load-balancer
+      LB_ALGORITHM: ${LB_ALGORITHM:-least_connections}
     volumes: # Mount the results directory from the host to the container
       - ./results:/app/results
 
