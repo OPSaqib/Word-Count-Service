@@ -3,6 +3,7 @@ import os
 import time
 
 # Load Balancer Configuration
+# TEST GNG
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 18861
 
