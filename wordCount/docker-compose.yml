@@ -7,7 +7,6 @@ services:
     volumes: # Store Redis data in a persistent Docker volume
       - redis-data:/data
 
-
 # Word Count Server 1 service
   server1:
     build: .
@@ -18,6 +17,9 @@ services:
     environment:
       SERVER_NAME: server1
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
+      FAILURE_SERVER: ${FAILURE_SERVER:-server1}
+      FAILURE_TYPE: ${FAILURE_TYPE:-crash}
+      FAILURE_DELAY_MS: ${FAILURE_DELAY_MS:-3000}
 
 
 # Word Count Server 2 service
@@ -30,6 +32,9 @@ services:
     environment:
       SERVER_NAME: server2
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
+      FAILURE_SERVER: ${FAILURE_SERVER:-server1}
+      FAILURE_TYPE: ${FAILURE_TYPE:-crash}
+      FAILURE_DELAY_MS: ${FAILURE_DELAY_MS:-3000}
 
 
   # Word Count Server 3 service
@@ -42,9 +47,13 @@ services:
     environment:
       SERVER_NAME: server3
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
+      FAILURE_SERVER: ${FAILURE_SERVER:-server1}
+      FAILURE_TYPE: ${FAILURE_TYPE:-crash}
+      FAILURE_DELAY_MS: ${FAILURE_DELAY_MS:-3000}
 
   # Word Count Load Balancer service
   load-balancer:
+    user: root
     build: .
     container_name: wordcount-load-balancer
     command: ["python", "-u", "load_balancer.py"]
@@ -56,6 +65,8 @@ services:
       LB_ALGORITHM: ${LB_ALGORITHM:-least_connections}
     ports:
       - "18861:18861"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock 
 
   # Word Count Client service
   client:

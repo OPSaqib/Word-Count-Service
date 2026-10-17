@@ -24,7 +24,8 @@ TEXT_REFERENCE = "sample2.txt"
 LOCAL_TEXT_PATH = "texts/sample2.txt"
 
 # Request rates (requests per second)
-REQUEST_RATES = [800, 900, 1000, 1100, 1200]
+#REQUEST_RATES = [800, 900, 1000, 1100, 1200]
+REQUEST_RATES = [800]
 
 DURATION_SECONDS = 10
 
@@ -39,7 +40,7 @@ NUM_CONNECTIONS = 100
 ROTATION_INTERVAL_SECONDS = 0.05
 
 # Max wait time for all responses
-RESPONSE_TIMEOUT_SECONDS = 60
+RESPONSE_TIMEOUT_SECONDS = 10
 
 # "cold": every request uses a different keyword -> every request is a cache miss
 # "warm": cache is pre-filled, only a few keywords -> every request is a cache hit
@@ -96,6 +97,22 @@ def prewarm_cache():
     finally:
         connection.close()
 
+
+def connection_serve(slot):
+    try:
+        slot['connection'].serve_all()
+    except Exception as e:
+        print('Exception occurred when serving: {e}')
+
+        # AsyncResults are never resolved. We need to update the pending completed results
+        with pool_lock:
+            pending = slot['pending']
+            slot['pending'] = 0
+
+        with lock:
+            completed += pending
+
+
 # Create one RPyC connection and its asynchronous call
 def open_connection():
     connection = rpyc.connect(SERVER_HOST, SERVER_PORT) # Connect to load balancer
@@ -105,9 +122,11 @@ def open_connection():
         # Create async call for count_word method
         async_call = rpyc.async_(connection.root.count_word)
 
+        slot = {"connection": connection, "async_call": async_call, "pending": 0}
+
         # Start a thread to serve all requests for this connection
-        threading.Thread(target=connection.serve_all, daemon=True).start()
-        return {"connection": connection, "async_call": async_call, "pending": 0}
+        threading.Thread(target=connection_serve, args=(slot,), daemon=True).start()
+        return slot
     except Exception:
         connection.close()
         raise
@@ -120,7 +139,7 @@ def open_connections(n):
             connections.append(open_connection())
     except Exception:
         close_connections(connections)
-        raise
+        raise RuntimeError('Initial connection could not be made')
     return connections
 
 # Close all RPyC connections
@@ -130,6 +149,8 @@ def close_connections(connections):
             slot["connection"].close()
         except Exception:
             pass
+
+completed = 0 
 
 # Run a single experiment with the request rate and async calls
 def run_experiment(rate):
@@ -163,13 +184,15 @@ def run_experiment(rate):
     all_done = threading.Event() # OFF: not all replies have arrived, ON: all replies have arrived
     latencies = []
     error_messages = []
+
+    global completed
     completed = 0
 
     # Callback function to handle responses from server
     def make_callback(sent_time, slot):
         # Once response arrived execute this function
         def on_response(result):
-            nonlocal completed
+            global completed
             received_time = time.perf_counter()
             try:
                 _ = result.value # Response (error or count)
@@ -271,6 +294,12 @@ def run_experiment(rate):
         stop_rotation.set()
         rotation_thread.join()
 
+    time.sleep(1)
+
+    print([c['pending'] for c in connections])
+    print(completed)
+    print(number_of_requests)
+
     # Wait for outstanding replies (nothing is sent anymore, this only collects)
     finished = all_done.wait(timeout=RESPONSE_TIMEOUT_SECONDS)
 
@@ -284,7 +313,7 @@ def run_experiment(rate):
     # Close all remaining current and old connections after replies have been collected
     with pool_lock:
         remaining_connections = list(connections) + list(retired_connections)
-    close_connections(remaining_connections)
+    #close_connections(remaining_connections)
 
     if not finished:
         print(f"WARNING: {lost} replies did not arrive within "

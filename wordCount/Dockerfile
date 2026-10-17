@@ -8,7 +8,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     rpyc \
     redis \
-    matplotlib
+    matplotlib \
+    docker
 
 # Copy the current directory contents into the container at /app
 COPY . .
