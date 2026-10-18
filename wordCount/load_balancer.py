@@ -2,10 +2,13 @@ import asyncio
 import datetime
 import docker
 import os
+import queue
 import random
 import rpyc
 import threading
 import time
+
+from rpyc.utils.server import ThreadedServer
 
 # Load Balancer Configuration
 # TEST GNG
@@ -25,7 +28,9 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True
+        "healthy": True,
+        "connection": None,
+        "pool": None
     },
 
     {
@@ -34,7 +39,9 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True
+        "healthy": True,
+        "connection": None,
+        "pool": None
     },
 
     {
@@ -43,15 +50,62 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True
+        "healthy": True,
+        "connection": None,
+        "pool": None
     }
 ]
+
+"""
+TODO:
+    - Make connection pooler per backend
+    - Health check on new connection.ping
+    - 
+"""
+
+class Metrics:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.received = 0
+        self.completed = 0
+        self.in_flight = 0
+        self.queue_estimate = 0
+
+metrics = Metrics()
+
+
+class ConnectionPool:
+    def __init__(self, host, port, n_connections: int = 5):
+        self.n_connections = n_connections
+        self.host = host
+        self.port = port
+        self.connections = queue.Qeueu()
+    
+    def cleanup_connections(self):
+        pass
+
+    def connect(self):
+        # TODO: handle connection error
+        for n in self.n_connections:
+            connection = rpyc.connect(self.host, self.port)
+            self.connections.put(connection)
+
+    def call(self, keyword, text):
+        # TODO: handle error in conneciton and update health accordingly
+        conn = self.connections.get(timeout=10)
+
+        result = conn.root.count_word(keyword, text)
+
+        self.connections.put(conn)
+
+        return result
 
 # A helper class that creates a thread-safe lock that can be used in asyncio routines as well
 # Note: this does not work well if the critical section contains await expressions, it will potentially lead to deadlocks
 class HybridThreadLock:
     def __init__(self):
         self.lock = threading.Lock()
+        self.duration = 0
 
     async def __aenter__(self):
         # Run lock acquisition on another thread, so that it does not block the asyncio loop
@@ -62,10 +116,17 @@ class HybridThreadLock:
         self.lock.release()
 
     def __enter__(self):
+        start = time.perf_counter()
         self.lock.acquire()
+        self.duration = time.perf_counter() - start
 
     def __exit__(self, type, value, traceback):
+        local_duration = self.duration
+
         self.lock.release()
+
+        if local_duration > 0.1:
+            log(f"Lock acquire took {local_duration:.3f}s")
 
 # Thread-safe lock to protect multiple clients trying to access the same server at the same time
 state_lock = HybridThreadLock()
@@ -83,12 +144,15 @@ def format_response(value):
 
     return f"{value:.3f} ms"
 
-
 # Performs a health check using an rpyc call
 def check_health(backend):
     try:
         # Open a connection to the backend
-        connection = rpyc.connect(backend['host'], backend['port'])
+        connection = backend['connection']
+
+        if connection is None:
+            open_connection(backend)
+            connection = backend['connection']
 
         # Check is the backend server is working normally
         connection.ping()
@@ -101,18 +165,16 @@ def check_health(backend):
                 backend['response_ms'] = None
     except Exception as e:
         # If an exception occurs, the backend must not be healthy
-        with state_lock:
-            log(f"{backend['name']} is unhealthy")
-            backend['healthy'] = False
+        set_unhealthy(backend, str(e))
 
 
 # Choose the next backend server based on current state and the selected load balancing algorithm
-async def choose_backend():
+def choose_backend():
 
     global tie_counter
 
     # Firstly lock the state to prevent race conditions when multiple clients are trying to choose a backend at the same time
-    async with state_lock:
+    with state_lock:
         # Only consider healthy backends
         healthy_backends = [backend for backend in BACKENDS if backend['healthy']]
 
@@ -168,15 +230,14 @@ async def choose_backend():
         return backend
 
 # Release the backend server after the request is completed
-async def release_backend(backend):
-    async with state_lock:
+def release_backend(backend):
+    with state_lock:
 
         backend["active"] = max(0, backend["active"] - 1)
 
 # Update the average response time for the backend server using an exponential moving average
-async def update_response_time(backend, sample_ms):
-
-    async with state_lock:
+def update_response_time(backend, sample_ms):
+    with state_lock:
 
         old = backend["response_ms"]
 
@@ -189,183 +250,141 @@ async def update_response_time(backend, sample_ms):
             # Use exponential moving average to update the response time
             backend["response_ms"] = (0.8 * old + 0.2 * sample_ms)
 
-# Handle the client connection, route the request to the selected backend, and manage the data transfer between client and backend
-# client_reader: Read byte stream from the client
-# client_writer: Write byte stream to the client
-async def handle_client(client_reader, client_writer):
-    
-    # Unique ID for tracking connections in the logs
-    uid = random.randint(10**5, 10**6-1)
+class Proxy(rpyc.Service):
 
-    peer = client_writer.get_extra_info("peername")
+    # Proxy method
+    def exposed_count_word(self, keyword, text):
+        with metrics.lock:
+            metrics.received += 1
+            metrics.in_flight += 1
 
-    # We attempt to choose a backend at most len(BACKENDS) times, if it does not succeed then it is unlikely that any backend is healthy.
-    for _ in range(len(BACKENDS)):
+        uid = random.randint(10**5, 10**6-1)
 
-        # Choose the backend server based on the selected load balancing algorithm
-        backend = await choose_backend()
-
-        log(f"ROUTE | id={uid} | " f"algorithm={ALGORITHM} | " f"client={peer} | " f"backend={backend['name']} | " f"active={backend['active']} | " f"response=" f"{format_response(backend['response_ms'])}")
-
-        # Establish a connection to the selected backend server
-        # We have: Client <-> Load Balancer <-> Backend Server
-        try:
-            (
-                backend_reader,
-                backend_writer
-            ) = await asyncio.open_connection(backend["host"], backend["port"])
+        # We try at most len(BACKENDS)
+        for _ in range(len(BACKENDS)):
             
-            # The connection is succesful, we can continue without trying again
-            break
+            bstart = time.perf_counter()
+            # Choose backend
+            backend = choose_backend()
 
-        except Exception as error:
-            log(f"BACKEND CONNECT ERROR | id={uid} | " f"backend={backend['name']} | " f"error={error}")
+            bduration = time.perf_counter() - bstart
             
-            # Update health
-            async with state_lock:
-                backend['healthy'] = False
-                backend['response_ms'] = None
-            
-            await release_backend(backend)
+            if bduration > 0.1:
+                log(f"took {bduration:.3f} to choose a backend")
 
-            # We try again
-            continue
+            # perform request
+            try: 
+                # For tracking requests in the logs
+                #log(f"ROUTE {uid} to {backend['name']}")
 
-    # If the loop is not broken out of, then all attempts have failed and we must close the client connection
-    else:
-            client_writer.close()
+                start = time.perf_counter()
+                
+                # Each connection runs on a separate thread, so we can run this as a blocking call. All requests
+                # are handled sequentially per connection in any case, even if they are request async on the client side.
+                result = backend['connection'].root.count_word(keyword, text)
 
-            await client_writer.wait_closed()
+                release_backend(backend)
 
-            return
+                # log(f'{uid} got result: {result}')
 
-    # Estimate the backend response time
-    waiting_since = None
+                response_ms = time.perf_counter() - start
 
-    # Continuosly read data from the client and send it to the backend server
-    async def client_to_server():
+                #log(f"FINISH {uid} in {response_ms:.3f} s")
 
-        nonlocal waiting_since
+                update_response_time(backend, response_ms)
 
-        # Forever loop to read data from the client and send it to the backend server
-        while True:
+                with metrics.lock:
+                    metrics.completed += 1
+                    metrics.in_flight -= 1
+                    metrics.queue_estimate = metrics.received - metrics.completed
+                
+                return result
 
-            # Read up to 65536 bytes from the client
-            data = await client_reader.read(65536)
+            except Exception as e:
+                # log(f"Error while trying to make request to {backend['name']} {e}")
+                # Mark backend as unhealthy and clean up connection
+                set_unhealthy(backend, str(e))
 
-            if not data:
-                break
+                # Try other backend
+                continue
+        else:
+            log(f"Could not respond to {uid}, no healthy backend available")
 
-            if waiting_since is None:
+            with metrics.lock:
+                metrics.completed += 1
+                metrics.in_flight -= 1
+                metrics.queue_estimate = metrics.received - metrics.completed
 
-                # Start measuring the time since we sent the request to the backend server
-                waiting_since = (time.perf_counter())
+def serve_all_wrapper(backend):
+    try:
+        backend['connection'].serve_all()
 
-            # Write the data to the backend server
-            backend_writer.write(data)
+        log(f"Serve thread for {backend['name']} stopped")
+    except Exception as e:
+        log(f"Serve thread for {backend['name']} exception: {e}")
 
-            # Drain the write buffer to ensure that all data is sent to the backend server
-            await backend_writer.drain()
+def set_unhealthy(backend, reason='No reason given'):
+    # If multiple requests fail, we don't want to acquire the lock for each failed attempt
+    # Hence we check first if the backend is already set to unhealthy
+    if not backend['healthy']:
+        return
 
-    # Continuosly read data from the backend server and send it to the client
-    async def server_to_client():
+    log(f"{backend['name']} is unhealthy: {reason}")
+    with state_lock:
+        if backend['healthy']:
+            backend['healthy'] = False
+            backend['response_ms'] = None
+            backend['connection'] = None
 
-        nonlocal waiting_since
-
-        try:
-            while True:
-
-                # Read up to 65536 bytes from the backend server
-                data = await backend_reader.read(65536)
-
-                if not data:
-                    break
-
-                if waiting_since is not None:
-
-                    # Calculate the time taken for the backend server to respond and convert it to milliseconds
-                    sample_ms = (time.perf_counter() - waiting_since) * 1000
-
-                    waiting_since = None
-
-                    # Update the average response time for the backend server
-                    await update_response_time(backend, sample_ms)
-
-                # Write the data to the client
-                client_writer.write(data)
-
-                # Drain the write buffer to ensure that all data is sent to the client
-                await client_writer.drain()
-        except asyncio.CancelledError:
-            # Send an explicit RST to prevent timeout hangs on the client's side
-            client_writer.transport.abort()
-
-            # We must not swallow the CancelledException according to the asyncio docs
-            raise
-
-    # Create two tasks to handle the data transfer between the client and the backend server concurrently
-    task_up = asyncio.create_task(client_to_server())
-
-    task_down = asyncio.create_task(server_to_client())
-
-    # Wait for either of the tasks to complete (i.e., either the client or the backend server closes the connection)
-    done, pending = await asyncio.wait([task_up, task_down], return_when=(asyncio.FIRST_COMPLETED))
-    
-    # Track if the connection is closed by the client or the server
-    did_client_disconnect = task_up in done
-
-    for task in pending:
-        task.cancel()
-
-    # Wait for the pending tasks to be cancelled and handle any exceptions that may occur during cancellation
-    pending_results = await asyncio.gather(*pending, return_exceptions=True)
-
-    done_results = await asyncio.gather(*done, return_exceptions=True)
-
-    # Close the connections to the backend server and the client
-    backend_writer.close()
-    client_writer.close()
-
-    # Wait for the connections to be fully closed and handle any exceptions that may occur during closure
-    await asyncio.gather(backend_writer.wait_closed(), client_writer.wait_closed(), return_exceptions=True)
-
-    # Release the backend server after the request is completed
-    await release_backend(backend)
-
-    log(f"CLOSE | id={uid} | closed by: {'client' if did_client_disconnect else 'server'} | " f"backend={backend['name']} | " f"active={backend['active']} | " f"response=" f"{format_response(backend['response_ms'])}")
 
 # The doctor performs health checks
 def doctor(backend):
     while True:
+        log(f"Queue estimate: {metrics.queue_estimate}")
         # Check and update health status of the backend
         check_health(backend)
     
         # restart if necessary
         if not backend['healthy']:
-            restart_backend(backend)
+            #restart_backend(backend)
+            check_health(backend)
+        
+        # Wait until next check
+        time.sleep(1)
 
-        # Sleep for 1 second before checking again
-        time.sleep(1.0)
+
+def open_connection(backend):
+    connection = rpyc.connect(backend['host'], backend['port'], config={'sync_request_timeout': 5})
+    #thread = threading.Thread(target=serve_all_wrapper, args=(backend,), daemon=False)
+    #thread.start()
+
+    with state_lock:
+        backend['connection'] = connection
 
 def restart_backend(backend):
     try:
         client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
         client.containers.get(f"wordcount-{backend['host']}").restart(timeout=0)
+
+        open_connection(backend)
+
     except Exception as e:
         log(f"Could not restart service {backend['name']}: {e}")
+        return
 
-async def main():
+def main():
     if ALGORITHM not in {"least_connections", "least_response_time"}:
-
         raise ValueError("LB_ALGORITHM must be " "'least_connections' or " "'least_response_time'")
 
     # Create health-checking threads for each backend to avoid async rpyc callback issues
     for backend in BACKENDS:
-        thread = threading.Thread(target=doctor, args=(backend,))
-        thread.start()
+        # Ensure it is running with a connection set up.
+        #restart_backend(backend)
+        open_connection(backend)
 
-    # Create actual TCP server that listens for incoming client connections and routes them to the appropriate backend server based on the selected load balancing algorithm
-    server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
+        # Run the health-checking on a separate thread to prevent blocking
+        thread = threading.Thread(target=doctor, args=(backend,), daemon=False)
+        thread.start()
 
     log("Starting Word Count Load Balancer")
 
@@ -375,11 +394,10 @@ async def main():
 
     log("Backends: " "server1, server2, server3")
 
-    async with server:
-        await server.serve_forever()
+    server = ThreadedServer(Proxy, hostname="0.0.0.0", port=18861)
+
+    server.start()
 
 if __name__ == "__main__":
+    main()
 
-    asyncio.run(
-        main()
-    )

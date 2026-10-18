@@ -30,6 +30,7 @@ def log(str):
 
 def simulate_failure():
     global server_start
+    return
 
     if SERVER_NAME != FAILURE_SERVER:
         return
@@ -90,10 +91,6 @@ def count_word_in_text(keyword, text):
 
 # Class to handle RPC requests for word counting
 class WordCountService(rpyc.Service):
-
-    # Expose a health check method that intended for the load balancer.
-    def exposed_health_check(self, value):
-        return value
 
     # Expose the count_word method to be callable by clients
     def exposed_count_word(self, keyword, text_reference):

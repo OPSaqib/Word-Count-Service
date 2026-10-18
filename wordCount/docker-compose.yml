@@ -53,7 +53,6 @@ services:
 
   # Word Count Load Balancer service
   load-balancer:
-    user: root
     build: .
     container_name: wordcount-load-balancer
     command: ["python", "-u", "load_balancer.py"]

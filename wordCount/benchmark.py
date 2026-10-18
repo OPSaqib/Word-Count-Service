@@ -24,8 +24,7 @@ TEXT_REFERENCE = "sample2.txt"
 LOCAL_TEXT_PATH = "texts/sample2.txt"
 
 # Request rates (requests per second)
-#REQUEST_RATES = [800, 900, 1000, 1100, 1200]
-REQUEST_RATES = [800]
+REQUEST_RATES = [800, 900, 1000, 1100, 1200, 1500, 2000, 2500, 3000]
 
 DURATION_SECONDS = 10
 
@@ -40,7 +39,7 @@ NUM_CONNECTIONS = 100
 ROTATION_INTERVAL_SECONDS = 0.05
 
 # Max wait time for all responses
-RESPONSE_TIMEOUT_SECONDS = 10
+RESPONSE_TIMEOUT_SECONDS = 30
 
 # "cold": every request uses a different keyword -> every request is a cache miss
 # "warm": cache is pre-filled, only a few keywords -> every request is a cache hit
@@ -296,9 +295,9 @@ def run_experiment(rate):
 
     time.sleep(1)
 
-    print([c['pending'] for c in connections])
-    print(completed)
-    print(number_of_requests)
+    #print([c['pending'] for c in connections])
+    #print(completed)
+    #print(number_of_requests)
 
     # Wait for outstanding replies (nothing is sent anymore, this only collects)
     finished = all_done.wait(timeout=RESPONSE_TIMEOUT_SECONDS)
