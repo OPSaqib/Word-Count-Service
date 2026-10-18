@@ -53,16 +53,6 @@ BACKENDS = [
     }
 ]
 
-class Metrics:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.received = 0
-        self.completed = 0
-        self.in_flight = 0
-        self.queue_estimate = 0
-
-metrics = Metrics()
-
 class ConnectionPool:
     def __init__(self, host, port, n_connections: int = 5):
         self.n_connections = n_connections
@@ -273,10 +263,6 @@ class Proxy(rpyc.Service):
 
     # Proxy method
     def exposed_count_word(self, keyword, text):
-        with metrics.lock:
-            metrics.received += 1
-            metrics.in_flight += 1
-
         uid = random.randint(10**5, 10**6-1)
 
         # We try at most len(BACKENDS)
@@ -311,11 +297,6 @@ class Proxy(rpyc.Service):
                 #log(f"FINISH {uid} in {response_ms:.3f} s")
 
                 update_response_time(backend, response_ms)
-
-                with metrics.lock:
-                    metrics.completed += 1
-                    metrics.in_flight -= 1
-                    metrics.queue_estimate = metrics.received - metrics.completed
                 
                 return result
 
@@ -331,10 +312,8 @@ class Proxy(rpyc.Service):
         # This runs only when the loop has finished, meaning all attempts have failed
         log(f"Could not respond to {uid}, no healthy backend available")
 
-        with metrics.lock:
-            metrics.completed += 1
-            metrics.in_flight -= 1
-            metrics.queue_estimate = metrics.received - metrics.completed
+        # We need to raise an exception so that rpyc can communicate to the client that the request has not been fulfilled
+        raise RuntimeException('No server available to fulfill the request')
 
 def serve_all_wrapper(backend):
     try:
@@ -348,7 +327,6 @@ def serve_all_wrapper(backend):
 # The doctor performs health checks
 def doctor(backend):
     while True:
-        log(f"Queue estimate: {metrics.queue_estimate}")
         # Check and update health status of the backend
         check_health(backend)
     
