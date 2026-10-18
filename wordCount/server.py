@@ -30,7 +30,6 @@ def log(str):
 
 def simulate_failure():
     global server_start
-    return
 
     if SERVER_NAME != FAILURE_SERVER:
         return

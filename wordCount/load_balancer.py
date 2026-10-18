@@ -28,8 +28,7 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True,
-        "connection": None,
+        "healthy": False,
         "pool": None
     },
 
@@ -39,8 +38,7 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True,
-        "connection": None,
+        "healthy": False,
         "pool": None
     },
 
@@ -50,18 +48,10 @@ BACKENDS = [
         "port": 18861,
         "active": 0,
         "response_ms": None,
-        "healthy": True,
-        "connection": None,
+        "healthy": False,
         "pool": None
     }
 ]
-
-"""
-TODO:
-    - Make connection pooler per backend
-    - Health check on new connection.ping
-    - 
-"""
 
 class Metrics:
     def __init__(self):
@@ -73,25 +63,30 @@ class Metrics:
 
 metrics = Metrics()
 
-
 class ConnectionPool:
     def __init__(self, host, port, n_connections: int = 5):
         self.n_connections = n_connections
         self.host = host
         self.port = port
-        self.connections = queue.Qeueu()
+        self.connections = queue.Queue()
     
     def cleanup_connections(self):
-        pass
+        while not self.connections.empty():
+            conn = self.connections.get()
+            conn.close()
 
     def connect(self):
-        # TODO: handle connection error
-        for n in self.n_connections:
-            connection = rpyc.connect(self.host, self.port)
+        for n in range(self.n_connections):
+            # Create connection
+            connection = rpyc.connect(self.host, self.port, config={'close_catchall': True})
+
+            # Ensure it works
+            connection.ping()
+
+            # Add it to the connection queue
             self.connections.put(connection)
 
     def call(self, keyword, text):
-        # TODO: handle error in conneciton and update health accordingly
         conn = self.connections.get(timeout=10)
 
         result = conn.root.count_word(keyword, text)
@@ -100,36 +95,8 @@ class ConnectionPool:
 
         return result
 
-# A helper class that creates a thread-safe lock that can be used in asyncio routines as well
-# Note: this does not work well if the critical section contains await expressions, it will potentially lead to deadlocks
-class HybridThreadLock:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.duration = 0
-
-    async def __aenter__(self):
-        # Run lock acquisition on another thread, so that it does not block the asyncio loop
-        await asyncio.to_thread(self.lock.acquire)
-
-    async def __aexit__(self, type, value, traceback):
-        # Lock release does not block so we run it directly.
-        self.lock.release()
-
-    def __enter__(self):
-        start = time.perf_counter()
-        self.lock.acquire()
-        self.duration = time.perf_counter() - start
-
-    def __exit__(self, type, value, traceback):
-        local_duration = self.duration
-
-        self.lock.release()
-
-        if local_duration > 0.1:
-            log(f"Lock acquire took {local_duration:.3f}s")
-
 # Thread-safe lock to protect multiple clients trying to access the same server at the same time
-state_lock = HybridThreadLock()
+state_lock = threading.Lock()
 
 # Rotate between servers equally good (round robin)
 tie_counter = 0
@@ -137,36 +104,88 @@ tie_counter = 0
 def log(str):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S.%f')}] {str}")
 
-# Helper function to format response time for logging
-def format_response(value):
-    if value is None:
-        return "unknown"
-
-    return f"{value:.3f} ms"
 
 # Performs a health check using an rpyc call
 def check_health(backend):
+    healthy = False
     try:
         # Open a connection to the backend
-        connection = backend['connection']
-
-        if connection is None:
-            open_connection(backend)
-            connection = backend['connection']
+        connection = rpyc.connect(backend['host'], backend['port'])
 
         # Check is the backend server is working normally
         connection.ping()
-        
-        # Set the health back to True
-        with state_lock:
-            if not backend['healthy']:
-                log(f"{backend['name']} is healthy")
-                backend['healthy'] = True
-                backend['response_ms'] = None
+    
+        # The backend is healthy
+        healthy = True
     except Exception as e:
         # If an exception occurs, the backend must not be healthy
-        set_unhealthy(backend, str(e))
+        healthy = False
+    finally:
+        log(f"{backend['name']} {'passed' if healthy else 'did not pass' } the health-check")
+        
+        # If the healthy value matches the current marked value, we simply return
+        with state_lock:
+            if backend['healthy'] == healthy:
+                return
 
+        # Otherwise we need to update it
+        if healthy:
+            server_set_healthy(backend)
+        else:
+            server_set_unhealthy(backend)
+
+
+# This function should only be called by check_health, running in the doctor threads
+def server_set_healthy(backend):
+    # We ensure healthy is false so we can be sure that no one is using its connection pool.
+    with state_lock:
+        if backend['healthy']:
+            backend['healthy'] = False
+    
+    # Create a fresh connection pool
+    pool = create_pool(backend)
+    
+    # If the pool connections could not be succesfully made, the backend is not yet healthy
+    if pool == None:
+        log(f"{backend['name']} passed the health check, but connections won't open.")
+        return
+
+    # We update the pool to a fresh pool and reset all statistics
+    with state_lock:
+        old_pool = backend['pool']
+        backend['pool'] = pool
+        backend['response_ms'] = None
+        backend['healthy'] = True
+
+    log(f"{backend['name']} is marked as healthy")
+    
+    # To be sure that we don't take up any resources, we close all old connections.
+    # We specify close_catchall = True in the config of the connections, so this cannot fail
+    if old_pool:
+        old_pool.cleanup_connections()
+
+# This function may be called from anywhere
+def server_set_unhealthy(backend):
+    did_change = False
+
+    with state_lock:
+        if backend['healthy']:
+            backend['healthy'] = False
+            did_change = True
+    
+    if did_change:
+        log(f"{backend['name']} is marked as unhealthy")
+
+def create_pool(backend):
+    pool = ConnectionPool(backend['host'], backend['port'], 5)
+
+    try:
+        pool.connect()
+
+        return pool
+    except Exception as e:
+        log(f"Exception during pool connect: {e}")
+        return None
 
 # Choose the next backend server based on current state and the selected load balancing algorithm
 def choose_backend():
@@ -281,7 +300,7 @@ class Proxy(rpyc.Service):
                 
                 # Each connection runs on a separate thread, so we can run this as a blocking call. All requests
                 # are handled sequentially per connection in any case, even if they are request async on the client side.
-                result = backend['connection'].root.count_word(keyword, text)
+                result = backend['pool'].call(keyword, text)
 
                 release_backend(backend)
 
@@ -301,19 +320,21 @@ class Proxy(rpyc.Service):
                 return result
 
             except Exception as e:
-                # log(f"Error while trying to make request to {backend['name']} {e}")
+                log(f"Error while trying to make request to {backend['name']} {e}")
+
                 # Mark backend as unhealthy and clean up connection
-                set_unhealthy(backend, str(e))
+                server_set_unhealthy(backend)
 
-                # Try other backend
+                # Try another backend
                 continue
-        else:
-            log(f"Could not respond to {uid}, no healthy backend available")
+        
+        # This runs only when the loop has finished, meaning all attempts have failed
+        log(f"Could not respond to {uid}, no healthy backend available")
 
-            with metrics.lock:
-                metrics.completed += 1
-                metrics.in_flight -= 1
-                metrics.queue_estimate = metrics.received - metrics.completed
+        with metrics.lock:
+            metrics.completed += 1
+            metrics.in_flight -= 1
+            metrics.queue_estimate = metrics.received - metrics.completed
 
 def serve_all_wrapper(backend):
     try:
@@ -322,19 +343,6 @@ def serve_all_wrapper(backend):
         log(f"Serve thread for {backend['name']} stopped")
     except Exception as e:
         log(f"Serve thread for {backend['name']} exception: {e}")
-
-def set_unhealthy(backend, reason='No reason given'):
-    # If multiple requests fail, we don't want to acquire the lock for each failed attempt
-    # Hence we check first if the backend is already set to unhealthy
-    if not backend['healthy']:
-        return
-
-    log(f"{backend['name']} is unhealthy: {reason}")
-    with state_lock:
-        if backend['healthy']:
-            backend['healthy'] = False
-            backend['response_ms'] = None
-            backend['connection'] = None
 
 
 # The doctor performs health checks
@@ -346,20 +354,12 @@ def doctor(backend):
     
         # restart if necessary
         if not backend['healthy']:
-            #restart_backend(backend)
+            restart_backend(backend)
             check_health(backend)
         
         # Wait until next check
         time.sleep(1)
 
-
-def open_connection(backend):
-    connection = rpyc.connect(backend['host'], backend['port'], config={'sync_request_timeout': 5})
-    #thread = threading.Thread(target=serve_all_wrapper, args=(backend,), daemon=False)
-    #thread.start()
-
-    with state_lock:
-        backend['connection'] = connection
 
 def restart_backend(backend):
     try:
@@ -372,19 +372,20 @@ def restart_backend(backend):
         log(f"Could not restart service {backend['name']}: {e}")
         return
 
+def init_doctor_threads():
+    for backend in BACKENDS:
+        # Run the health-checking on a separate thread to prevent blocking
+        thread = threading.Thread(target=doctor, args=(backend,), daemon=False)
+        thread.start()
+
+
 def main():
     if ALGORITHM not in {"least_connections", "least_response_time"}:
         raise ValueError("LB_ALGORITHM must be " "'least_connections' or " "'least_response_time'")
 
-    # Create health-checking threads for each backend to avoid async rpyc callback issues
-    for backend in BACKENDS:
-        # Ensure it is running with a connection set up.
-        #restart_backend(backend)
-        open_connection(backend)
+    init_doctor_threads()
 
-        # Run the health-checking on a separate thread to prevent blocking
-        thread = threading.Thread(target=doctor, args=(backend,), daemon=False)
-        thread.start()
+    # Create health-checking threads for each backend to avoid async rpyc callback issues
 
     log("Starting Word Count Load Balancer")
 
