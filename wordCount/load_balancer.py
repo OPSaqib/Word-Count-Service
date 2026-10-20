@@ -1,4 +1,3 @@
-import asyncio
 import datetime
 import docker
 import os
@@ -294,7 +293,7 @@ class Proxy(rpyc.Service):
 
                 response_ms = time.perf_counter() - start
 
-                #log(f"FINISH {uid} in {response_ms:.3f} s")
+                # log(f"FINISH {uid} in {response_ms:.3f} s")
 
                 update_response_time(backend, response_ms)
                 
@@ -313,7 +312,7 @@ class Proxy(rpyc.Service):
         log(f"Could not respond to {uid}, no healthy backend available")
 
         # We need to raise an exception so that rpyc can communicate to the client that the request has not been fulfilled
-        raise RuntimeException('No server available to fulfill the request')
+        raise RuntimeError('No server available to fulfill the request')
 
 def serve_all_wrapper(backend):
     try:
@@ -344,8 +343,6 @@ def restart_backend(backend):
         client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
         client.containers.get(f"wordcount-{backend['host']}").restart(timeout=0)
 
-        open_connection(backend)
-
     except Exception as e:
         log(f"Could not restart service {backend['name']}: {e}")
         return
@@ -362,8 +359,6 @@ def main():
         raise ValueError("LB_ALGORITHM must be " "'least_connections' or " "'least_response_time'")
 
     init_doctor_threads()
-
-    # Create health-checking threads for each backend to avoid async rpyc callback issues
 
     log("Starting Word Count Load Balancer")
 

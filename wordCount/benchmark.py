@@ -24,7 +24,7 @@ TEXT_REFERENCE = "sample2.txt"
 LOCAL_TEXT_PATH = "texts/sample2.txt"
 
 # Request rates (requests per second)
-REQUEST_RATES = [800, 900, 1000, 1100, 1200, 1500, 2000, 2500, 3000]
+REQUEST_RATES = [800, 900, 1000, 1100, 1200, 1500, 2000]
 
 DURATION_SECONDS = 10
 
@@ -369,7 +369,7 @@ def main():
         time.sleep(3)
 
     # Write to CSV and save results
-    output_file = f"results/phase3_{LB_ALGORITHM}.csv"
+    output_file = f"results/phase4_{LB_ALGORITHM}.csv"
     with open(output_file, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=[
             "algorithm",
